@@ -229,6 +229,9 @@ file pmon/cmds/cmd_log.c		(logfile & ramfiles)	needs-flag
 file pmon/cmds/sz_cmd.c			pmon_zmodem_sz
 file pmon/cmds/cmd_main/cmd_main.c cmd_main
 file pmon/cmds/cmd_main/window.c cmd_main
+file pmon/cmds/cmd_dstling.c
+
+
 
 file pmon/common/about.c		cmd_about
 file pmon/common/autoconf.c		sys
