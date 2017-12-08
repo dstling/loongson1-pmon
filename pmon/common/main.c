@@ -281,8 +281,15 @@ int main(void)
 
 	char *s;
 
-	s = getenv("al");
-	if(s) autoload(s);
+	s=getenv("user_pro");//查找裸机程序运行变量 
+	if(s==NULL||strcmp(s,"yes")!=0)//环境变量没有设置或者不等yes
+	{
+		s = getenv("al");//执行默认设置
+		if(s) autoload(s);
+	}
+	else//进入裸机引导程序
+		auto_load_user_pro();
+	
 	while (1) {
 	if(getenv("prompt"))
 		strncpy (prompt, getenv ("prompt"), sizeof(prompt));

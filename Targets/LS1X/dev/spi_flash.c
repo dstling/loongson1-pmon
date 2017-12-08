@@ -173,6 +173,30 @@ int spi_flash_erase_area(unsigned int saddr, unsigned int eaddr, unsigned sector
 	return 0;
 }
 
+//dstling
+int spi_flash_erase_sector(unsigned int saddr, unsigned int eaddr, unsigned sectorsize)//0x1000
+{
+	unsigned int addr;
+
+	for (addr=saddr; addr<eaddr; addr+=sectorsize) 
+	{
+		write_enable();
+		write_status(0x00);
+		while (read_status() & 0x01);
+		write_enable();
+
+		ls1x_spi_chipselect(&spi_flash, 1);
+		ls1x_spi_writeb(&spi_flash, 0x20);
+		ls1x_spi_writeb(&spi_flash, addr >> 16);
+		ls1x_spi_writeb(&spi_flash, addr >> 8);
+		ls1x_spi_writeb(&spi_flash, addr);
+		ls1x_spi_chipselect(&spi_flash, 0);
+		while (read_status() & 0x01);
+	}
+	while (read_status() & 0x01);
+	return 0;
+}
+
 int spi_flash_write_area(int flashaddr, char *buffer, int size)
 {
 	int i;
