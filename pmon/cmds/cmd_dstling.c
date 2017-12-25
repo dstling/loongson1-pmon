@@ -15,9 +15,22 @@
 #include <exec.h>
 #include <pmon/loaders/loadfn.h>
 #include <pmon.h>
+#include <file.h>
+#include <mtdfile.h>
+#include <unistd.h>
+#include "../loaders/elf.h"
+#ifdef __mips__
+#include <machine/cpu.h>
+#endif
+#include <sys/param.h>
 
-//unsigned int led_counter=0;
-//#define BOARD_RUN_LED {gpio_set_value(32, led_counter%2);led_counter++;}
+int elfreadsyms(int fd, Elf32_Ehdr *eh, Elf32_Shdr *shtab, int flags);
+static unsigned long tablebase;
+static int	bootseg;
+static int myflags;
+static unsigned int lastaddr=0;;
+extern unsigned long long dl_loffset;
+
 #define USER_DATA_POS	0x60000//1 block=16sector 1sector=8page 1page=512byte  512K=8block
 #define USER_DATA_SIZE	0x10000//
 #define FLASH_SECSIZE	512 //(512-350-64)*1024
@@ -25,7 +38,28 @@
 #define SEND_NEXT_FILE_DATA  printf("%s",START_SEND_FILE_CMD)
 unsigned char *received_file_data_buf=NULL;//接收到的文件数据 
 
+struct in_flash_file_str
+{
+	unsigned int nand_pro_len;//nand中存储的用户程序文件长度
+	unsigned int file_data_crc;//存储的crc值
+};
+
+#define USING_NOR 	1
+#define USING_NAND 	2
+char load_nor_or_nand=0;//1 nor 2 nand
+
+char nand_mtd_name[128]="";//用于读写nand中裸机程序路径
+int read_nand_fp=0;
+int nand_pro_len=0;//nand中存储的用户程序文件长度
+struct in_flash_file_str  flash_file_head={0,0xffffffff};
+
+
+unsigned int now_flash_read_pos=0;//当前读取的文件位置
+
+
 /*
+unsigned int led_counter=0;
+#define BOARD_RUN_LED {gpio_set_value(32, led_counter%2);led_counter++;}
 void board_run_led()
 {
 	
@@ -33,82 +67,23 @@ void board_run_led()
 	led_counter++;
 }
 */
+
+
+unsigned int comp_crc16(unsigned char *pack, unsigned char num); 
+
 int read_flash_data_cmd(int ac, char *av[]);
 int write_flash_data_cmd(int ac, char *av[]);
-int erase_user_space(void);
+int erase_user_space(int ac, char *av[]);
 int flash_erase_sector_cmd(int ac, char *av[]);
-int user_load(void);
-int recv_data_test_cmd(void);
-char CRC16_checkPACK(unsigned char *rec_buff , int rec_num);
-char CRC16_check_all_data(unsigned char *data_buf , int data_buf_all_len,int data_buf_frame_len,unsigned char *crc_buf,int crc_len);//(512+2)*2
+int user_load(int ac, char *av[]);
 
+void write_into_nand_cmd(int ac, char *av[]);
+void read_from_nand_cmd(int ac, char *av[]);
 
-static const Cmd Cmdss[] = {
-	{"Dstling cmd"},
-	{"write_flash_data",	"addr datas",
-			0,
-			"write_flash_data_cmd",
-			write_flash_data_cmd, 1, 16, 0},
-	{"read_flash_data",		"addr len",
-			0,
-			"read_flash_data",
-			read_flash_data_cmd, 1, 16, 0},
-	{"erase_user_space", 	"(void)",
-			0,
-			"erase_user_space",
-			erase_user_space, 1, 16, 0},
-	{"user_load",	"(void)",
-			0,
-			"user_load",
-			user_load, 1, 16, 0},
-	{"recv_data_test_cmd",	"(void)",
-			0,
-			"recv_data_test_cmd",
-			recv_data_test_cmd, 1, 16, 0},
-			
-	{"erase_sector",	"(startaddr endaddr)",
-			0,
-			"erase_sector",
-			flash_erase_sector_cmd, 1, 16, 0},
+int write_into_nand_data(char * buf,int buf_len,unsigned int addr);
+int read_from_nand_data(int addr,char*buf,int buf_len);
 
-	
-		
-	{0, 0}
-};
-
-static void init_cmd __P((void)) __attribute__ ((constructor));
-
-static void init_cmd()
-{
-	cmdlist_expand(Cmdss, 1);
-}
-
-
-
-void user_data_write(char *buffer,int buffer_size)
-{
-	if(buffer_size>USER_DATA_SIZE)
-	{
-		printf("WARNNING:buffer size above the flash reserve size.buffer size:%d reserve flash size:%d\n",buffer_size,USER_DATA_SIZE);
-		return ;
-	}
-	spi_flash_erase_area(USER_DATA_POS, USER_DATA_POS+buffer_size, 0x10000);
-	spi_flash_write_area(USER_DATA_POS, buffer, buffer_size);
-}
-
-void pmon_data_write(char *buffer,int buffer_size)
-{
-	spi_flash_erase_area(0, 0x60000, 0x10000);
-	spi_flash_write_area(0, buffer, buffer_size);
-}
-
-void read_flash_data(unsigned int addr,unsigned int read_len,char *buffer)
-{
-	if(read_len<1||buffer==0)
-		return;
-	spi_flash_read_area(addr, buffer, read_len);
-}
-
+int recv_hex_data(int ac, char *av[]);
 
 unsigned int str_to_hex(char * p)
 {
@@ -169,14 +144,147 @@ bool panduan_hex(char * p)
 	return 1;
 }
 
+int find_desc_from_src(int from,char * src,unsigned int src_len,char * desc,unsigned int desc_len)
+{
+	int i=from;//由于从src结尾附近找 从这里开始
+	int j=0;
+	if(i<0)//指令过长
+		return 0;
+	for(;i<src_len;i++)//没到结尾
+	{
+		for(j=0;j<desc_len;j++)
+		{
+			if(desc[j]==src[i+j])//如果相同 比对下一个
+				continue;
+			else
+				break;
+		}
+		if(desc[j]=='\0')//成功比对到结尾了
+			return i;//返回当前找到的字符串开始位置
+	}
+	return -1;
+}
 
 void show_hex(char * p,unsigned int len)
 {
 	int i=0;
+	printf("\n");
 	for(i=0;i<len;i++)
 		printf("%02X ",(unsigned char)p[i]);
 	printf("\n");
 }
+
+void dstling(int ac, char *av[])
+{
+	printf("STDIN:%d\n",STDIN);
+	printf("kbd_available:%d\n",kbd_available);
+	printf("usb_kbd_available:%d\n",usb_kbd_available);
+}
+
+static const Cmd Cmdss[] = {
+	{"Dstling cmd"},
+	{"dstling",	"void",
+			0,
+			"dstling",
+			dstling, 1, 16, 0},
+	{"write_flash_data",	"addr datas",
+			0,
+			"write_flash_data_cmd",
+			write_flash_data_cmd, 1, 16, 0},
+	{"read_flash_data",		"addr len",
+			0,
+			"read_flash_data",
+			read_flash_data_cmd, 1, 16, 0},
+	{"erase_user_space", 	"(void)",
+			0,
+			"erase_user_space",
+			erase_user_space, 1, 16, 0},
+	{"user_load",	"(void)",
+			0,
+			"user_load",
+			user_load, 1, 16, 0},
+			
+	{"erase_sector",	"(startaddr endaddr)",
+			0,
+			"erase_sector",
+			flash_erase_sector_cmd, 1, 16, 0},
+	{"write_into_nand",	"(/dev/mtdx buf buf_len)",
+			0,
+			"write_into_nand",
+			write_into_nand_cmd, 1, 16, 0},
+	{"read_from_nand", "(/dev/mtdx offset datas_len)",
+			0,
+			"read_from_nand",
+			read_from_nand_cmd, 1, 16, 0},
+	{"recv_hex_data", "(void)",
+			0,
+			"recv_hex_data",
+			recv_hex_data, 1, 16, 0},
+	
+	{0, 0}
+};
+
+static void init_cmd __P((void)) __attribute__ ((constructor));
+
+static void init_cmd()
+{
+	cmdlist_expand(Cmdss, 1);
+}
+
+void init_nand_or_nor_env(void)
+{
+	char * s=NULL;
+	s = getenv("user_pro");
+	if(s==NULL)
+	{
+		printf("need set user_pro no .  or yes  :%s\n",s);
+		return;
+	}
+	//printf("user_load sta:%s\n",s);
+	
+	memset(nand_mtd_name,0,128);
+	if(find_desc_from_src(0,s,strlen(s),"/dev/mtd",8)==0)
+	{
+		strncpy(nand_mtd_name,s,strlen(s));
+		load_nor_or_nand=USING_NAND;
+		now_flash_read_pos=0;
+		printf("We use nand flash for user pro:%s\n",nand_mtd_name);
+	}
+	else if(strcmp(s,"nor_flash")==0)
+	{
+		load_nor_or_nand=USING_NOR;
+		now_flash_read_pos=USER_DATA_POS;
+		printf("We use nor flash for user pro:%s\n",s);
+	}
+	else 
+		printf("We use what for user pro:%s??\n",s);
+}
+
+
+void user_data_write(char *buffer,int buffer_size)
+{
+	if(buffer_size>USER_DATA_SIZE)
+	{
+		printf("WARNNING:buffer size above the flash reserve size.buffer size:%d reserve flash size:%d\n",buffer_size,USER_DATA_SIZE);
+		return ;
+	}
+	spi_flash_erase_area(USER_DATA_POS, USER_DATA_POS+buffer_size, 0x10000);
+	spi_flash_write_area(USER_DATA_POS, buffer, buffer_size);
+}
+
+void pmon_data_write(char *buffer,int buffer_size)
+{
+	spi_flash_erase_area(0, 0x60000, 0x10000);
+	spi_flash_write_area(0, buffer, buffer_size);
+}
+
+void read_flash_data(unsigned int addr,unsigned int read_len,char *buffer)
+{
+	if(read_len<1||buffer==0)
+		return;
+	spi_flash_read_area(addr, buffer, read_len);
+}
+
 int read_flash_data_cmd(int ac, char *av[])
 {
 	char ret=0;
@@ -188,7 +296,7 @@ int read_flash_data_cmd(int ac, char *av[])
 	if(ac<3)
 	{
 		printf("useage: read_flash_data addr 32\n");
-		return;
+		return 0;
 	}
 
 	char * pt=av[1]+2;
@@ -196,7 +304,7 @@ int read_flash_data_cmd(int ac, char *av[])
 	if(ret==0)
 	{
 		printf("arg 1 not a hex addr.for example:0x12345678\n");
-		return;
+		return 0;
 	}
 	addr=str_to_hex(pt);
 	read_data_len=atoi(av[2]);
@@ -233,7 +341,7 @@ int write_flash_data_cmd(int ac, char *av[])
 	if(ac<3)
 	{
 		printf("useage: write_flash_data_cmd addr 32\n");
-		return;
+		return 0;
 	}
 
 	char * pt=av[1]+2;
@@ -241,7 +349,7 @@ int write_flash_data_cmd(int ac, char *av[])
 	if(ret==0)
 	{
 		printf("arg 1 not a hex addr.for example:0x12345678\n");
-		return;
+		return 0;
 	}
 	addr=str_to_hex(pt);
 	write_data_len=strlen(av[2]);
@@ -253,11 +361,23 @@ int write_flash_data_cmd(int ac, char *av[])
     return (1);
 }
 
-int erase_user_space(void)
+int erase_user_space(int ac, char *av[])
 {
-	printf("Wait a minute...\n");
-	spi_flash_erase_area(USER_DATA_POS, USER_DATA_POS+NVRAM_SECSIZE, 0x10000);
-    return (1);
+	init_nand_or_nor_env();
+	if(load_nor_or_nand==USING_NOR)
+	{
+		printf("Wait a minute...\n");
+		spi_flash_erase_area(USER_DATA_POS, USER_DATA_POS+NVRAM_SECSIZE, 0x10000);
+    }
+	else if(load_nor_or_nand==USING_NAND)
+	{
+		char cmdx[256];
+		memset(cmdx,0,256);
+		strcat(cmdx,"mtd_erase ");
+		strcat(cmdx,nand_mtd_name);
+		do_cmd(cmdx);
+	}
+	return (1);
 }
 
 //#include <target/ls1x_spi.h>
@@ -271,7 +391,7 @@ int flash_erase_sector_cmd(int ac, char *av[])
 	if(ac<3)
 	{
 		printf("useage: erase_sector startaddr endaddr\n");
-		return;
+		return 0;
 	}
 
 	char * pt=av[1]+2;
@@ -279,7 +399,7 @@ int flash_erase_sector_cmd(int ac, char *av[])
 	if(ret==0)
 	{
 		printf("arg 1 not a hex addr.for example:0x12345678\n");
-		return;
+		return 0;
 	}
 	startaddr=str_to_hex(pt);
 
@@ -288,7 +408,7 @@ int flash_erase_sector_cmd(int ac, char *av[])
 	if(ret==0)
 	{
 		printf("arg 2 not a hex addr.for example:0x12345678\n");
-		return;
+		return 0;
 	}
 	endaddr=str_to_hex(pt);
 	
@@ -298,67 +418,42 @@ int flash_erase_sector_cmd(int ac, char *av[])
     return (1);
 }
 
-
-
-long load_elf_dst(int fd, char *buf, int *n, int flags);
-int user_load(void)
-{
-	long ep=-1;
-	int n=0;
-	int flags=0;
-	static char buf[2048];
-	ep = load_elf_dst(0,buf,&n, flags);
-	printf ("user_load Entry address is %08x\n", ep);
-	if (ep == -1) {
-		fprintf(stderr, "%s: boot failed\n", "nor flash");
-		return EXIT_FAILURE;
-	}
-
-	if (ep == -2) {
-		fprintf(stderr, "%s: invalid file format\n", "nor flash");
-		return EXIT_FAILURE;
-	}
-	
-	printf ("user_load Entry address is %08x\n", ep);
-
-	if (md_cachestat())
-		flush_cache(DCACHE | ICACHE, NULL);
-	md_setpc(NULL, ep);
-	if (!(flags & SFLAG)) 
-	{
-		dl_setloadsyms();
-	}
-	return 0;
-}
-
-
-#include <unistd.h>
-#include "../loaders/elf.h"
-#ifdef __mips__
-#include <machine/cpu.h>
-#endif
-#include <sys/param.h>
-
-int elfreadsyms(int fd, Elf32_Ehdr *eh, Elf32_Shdr *shtab, int flags);
-static unsigned long tablebase;
-static int	bootseg;
-static int myflags;
-static unsigned int lastaddr=0;;
-extern unsigned long long dl_loffset;
-
-
-unsigned int now_flash_read_pos=USER_DATA_POS;
 int read_dst(void *buf, int size)
 {
-	read_flash_data(now_flash_read_pos,size,buf);
-	now_flash_read_pos+=size;
-	return size;
+	if(load_nor_or_nand==USING_NOR)
+	{
+		read_flash_data(now_flash_read_pos,size,buf);
+		now_flash_read_pos+=size;
+		return size;
+	}
+	else if(load_nor_or_nand==USING_NAND&&read_nand_fp)
+	{
+		int readed_len=read(read_nand_fp,buf,size);
+		now_flash_read_pos+=readed_len;
+		return  readed_len;
+	}
+	else
+		return 0;
+	
 }
 unsigned int lseek_dst(unsigned int pos,int whereflag)
 {
 	if(whereflag==SEEK_SET)
-		now_flash_read_pos=USER_DATA_POS+pos;
-	return pos;
+	{
+		if(load_nor_or_nand==USING_NOR)
+		{
+			now_flash_read_pos=USER_DATA_POS+pos;
+			return pos;
+		}
+		else if(load_nor_or_nand==USING_NAND&&read_nand_fp)
+		{
+			now_flash_read_pos=lseek(read_nand_fp, pos, SEEK_SET);
+			return now_flash_read_pos;
+		}
+		else
+			return 0;
+	}
+	return 0;
 }
 
 static void *gettable(int size, char *name, int flags)
@@ -383,8 +478,6 @@ static void *gettable(int size, char *name, int flags)
 	return (void *) base;
 }
 
-
-
 int bootread_dst(int fd, void *addr, int size)
 {
 	int i;
@@ -395,7 +488,6 @@ int bootread_dst(int fd, void *addr, int size)
 	if (!dl_checksetloadaddr (addr + dl_offset, size, 1))
 		return (-1);
 
-	//i = read (fd, addr + dl_offset, size);
 	i = read_dst(addr + dl_offset, size);
 	if (i < size) 
 	{
@@ -618,9 +710,12 @@ static int bootclear_dst(int fd, void *addr, int size)
 		return (-1);
 
 	if (size > 0)
+	{
 		if(myflags&OFLAG)
-		highmemset((unsigned long long)(dl_loffset-lastaddr+(unsigned long)addr),0,size);
-		else bzero (addr + dl_offset, size);
+			highmemset((unsigned long long)(dl_loffset-lastaddr+(unsigned long)addr),0,size);
+		else 
+			bzero (addr + dl_offset, size);
+	}
 	    
 	return size;
 }
@@ -643,7 +738,7 @@ long load_elf_dst(int fd, char *buf, int *n, int flags)
 #else
 	tablebase = memorysize;
 #endif
-	lseek_dst(*n,0);	
+	lseek_dst(*n,SEEK_SET);	
 	ep = (Elf32_Ehdr *)buf;
 	if (sizeof(*ep) > *n) //52>0 yes
 	{
@@ -800,238 +895,66 @@ long load_elf_dst(int fd, char *buf, int *n, int flags)
 	return (ep->e_entry + dl_offset);
 }
 
-int recv_data_test_cmd(void)
+int user_load(int ac, char *av[])
 {
-	struct termio sav;
-	unsigned int cnt;
-	unsigned char *recv_buf=NULL;//存储文件数据
-	int recv_count=0;
-	char return_flag=0;
-
-	unsigned char * crc_buf=NULL;//存储接收到的crc数据
-	int crc_buf_count=0;
+	long ep=-1;
+	int n=0;
+	int flags=0;
+	static char buf[2048];
 	
-	char *pt=NULL,*pt_data=NULL;
-	char str_to_int_temp[9];
+	init_nand_or_nor_env();
 	
-	char start_rec_flag=1;
-	char start_rec_counter=0;
-	char rec_file_size_temp[64];
-	int file_len=0;
-	int frame_len=0;
-	int frame_one_time_counter=0;
-	int file_leixing_flag=0;
-
-	char stdin_read_temp[4096];
-	int stdin_read_temp_len=0;
-	
-	memset(rec_file_size_temp,0,64);
-	
-	printf("recv_data_test_cmd.\n");
-	ioctl(STDIN, CBREAK, &sav);
-	ioctl(STDIN, FIONREAD, &cnt);
-	while(cnt)
+	if(load_nor_or_nand==USING_NAND)//如果是从nand引导 需要打开mtd文件
 	{
-		fflush(STDIN);
-		ioctl(STDIN, FIONREAD, &cnt);
+		read_nand_fp = open(nand_mtd_name, O_RDONLY);
+		if (!read_nand_fp) 
+		{
+			printf("open file:%s error!\n",av[1]);
+			return 1;
+		}
+		now_flash_read_pos=0;
+		lseek(read_nand_fp, 0, SEEK_SET);
 	}
-	while(1)
+	else if(load_nor_or_nand==USING_NOR)
+		now_flash_read_pos=USER_DATA_POS;
+	
+	ep = load_elf_dst(0,buf,&n, flags);
+	printf ("user_load Entry address is %08x\n", ep);
+	if (ep == -1) 
 	{
-		ioctl (STDIN, FIONREAD, &cnt);
-		if(start_rec_flag&&cnt>0&&start_rec_counter<24)//先接收文件发送的相关信息
-		{
-			for(;cnt!=0&&start_rec_counter<24;start_rec_counter++,cnt--)
-				rec_file_size_temp[start_rec_counter]=getchar();
-
-			if(start_rec_counter==24)
-			{
-				pt=rec_file_size_temp;
-				//printf("rec_file_size_temp:%s\n",rec_file_size_temp);
-				memset(str_to_int_temp,0,9);
-				strncpy(str_to_int_temp,pt,8);
-				file_len=str_to_hex(str_to_int_temp);
-				
-				memset(str_to_int_temp,0,9);
-				strncpy(str_to_int_temp,pt+8,8);
-				frame_len=str_to_hex(str_to_int_temp);
-
-				memset(str_to_int_temp,0,9);
-				strncpy(str_to_int_temp,pt+16,8);
-				file_leixing_flag=str_to_hex(str_to_int_temp);
-
-				if(file_leixing_flag!=3512&&file_leixing_flag!=1234)
-				{
-					printf("recv file head info check faild:%d.\n",file_leixing_flag);
-					fflush(STDIN);
-					ioctl(STDIN, TCSETAF, &sav);
-					return;
-				}
-				
-				printf("file_len:%d frame_len:%d pass:%d\n",file_len,frame_len,file_leixing_flag);
-				recv_buf=(unsigned char *)malloc((file_len+10)*2*sizeof(unsigned char));
-				if(recv_buf==NULL)
-				{
-					printf("req recv_file mem faild.quit recv file.\n");
-					return;
-				}
-				memset(recv_buf,0,(file_len+10)*2);
-
-				crc_buf=(unsigned char *)malloc((file_len/frame_len+3)*4);
-				if(crc_buf==NULL)
-				{
-					printf("req crc_buf mem faild.quit recv file.\n");
-					return;
-				}
-				memset(crc_buf,0,(file_len/frame_len+3)*4);
-				
-				start_rec_flag=0;
-				//printf("%s",START_SEND_FILE_CMD);
-				SEND_NEXT_FILE_DATA;
-			}
-
-		}
-		
-		if(!start_rec_flag&&cnt>0)
-		{
-			memset(stdin_read_temp,0,4096);
-			stdin_read_temp_len=read(STDIN,stdin_read_temp,cnt);
-			//printf("\ncnt:%d frame_one_time_counter:%d\n%s",cnt,frame_one_time_counter,stdin_read_temp);
-			int xxi=0;
-			for(xxi=0;xxi<stdin_read_temp_len;xxi++,frame_one_time_counter++,recv_count++)
-			{
-				recv_buf[recv_count]=stdin_read_temp[xxi];
-				if(recv_buf[recv_count]=='@'&&recv_count>3&&recv_buf[recv_count-3]=='e'&& recv_buf[recv_count-2]=='n'&& recv_buf[recv_count-1]=='d')
-				{
-					return_flag=1;
-					break;
-				}
-			}
-			if(frame_one_time_counter>=(frame_len+2)*2)//接受完一段文件数据 字符串中最后四个字符是crc16校验数据
-			{
-				char*ptt=recv_buf;
-				ptt=ptt+recv_count-4;//定位到crc位置
-				char*p_crc_buf=crc_buf+crc_buf_count;
-				strncpy(p_crc_buf,ptt,4);//将crc数据复制进crc_buf;
-				crc_buf_count+=4;
-				recv_count=recv_count-4;//去掉结尾的四个校验数据
-				frame_one_time_counter=0;
-				SEND_NEXT_FILE_DATA;
-				/*
-				//这里进行crc检验 比较浪费时间
-				if(CRC16_checkPACK(ptt,(frame_len+2)*2))
-				{
-					frame_one_time_counter=0;
-					recv_count=recv_count-4;//去掉结尾的四个校验数据
-					SEND_NEXT_FILE_DATA;
-					//BOARD_RUN_LED;
-				}
-				else//校验失败
-				{
-					fflush(STDIN);
-					ioctl(STDIN, TCSETAF, &sav);
-					free(recv_buf);
-					printf("CRC check faild\n");
-					return;
-				}
-				*/
-			}
-		}
-		
-		if(return_flag)//文件发送结束
-		{
-			ioctl (STDIN, FIONREAD, &cnt);
-			char*ptt=recv_buf;
-			ptt=ptt+recv_count-3-4;//去掉结尾的end 定位到crc位置
-			char*p_crc_buf=crc_buf+crc_buf_count;
-			strncpy(p_crc_buf,ptt,4);//将crc数据复制进crc_buf;
-			crc_buf_count+=4;
-			
-			recv_count=recv_count-4-3;//去掉结尾的四个校验数据和end数据
-			printf("\nreceived all file data.\n");
-			/*
-			ioctl (STDIN, FIONREAD, &cnt);
-			char*ptt=recv_buf;
-			ptt=ptt+recv_count-frame_one_time_counter;
-			if(CRC16_checkPACK(ptt,frame_one_time_counter-3))//去掉结尾的end@
-			{
-				//frame_one_time_counter=0;
-				//recv_count=recv_count-4;//去掉结尾的四个校验数据
-				printf("\nrecv end flag\n");
-				//BOARD_RUN_LED;
-			}
-			else//校验失败
-			{
-				fflush(STDIN);
-				ioctl(STDIN, TCSETAF, &sav);
-				free(recv_buf);
-				printf("tail CRC check faild.\n");
-				return;
-			}
-			*/
-			break;
-		}
+		fprintf(stderr, "%s: boot failed\n", (load_nor_or_nand==USING_NOR)?"nor flash":nand_mtd_name);
+		return EXIT_FAILURE;
 	}
-	printf("\nCRC verification.\n");
-	pt=recv_buf;
-	if(CRC16_check_all_data(pt,recv_count,frame_len,crc_buf,crc_buf_count))
+	else if (ep == -2) 
 	{
-		printf("\nCRC verification successful.\n");
-		received_file_data_buf=(unsigned char *)malloc(file_len*sizeof(unsigned char)+10);
-		if(received_file_data_buf==NULL)
-		{
-			printf("req hex_buf mem faild.quit recv file.\n");
-			free(recv_buf);
-			return;
-		}
-		memset(received_file_data_buf,0,file_len);
-		pt_data=received_file_data_buf;
-		unsigned int index=0;
-		unsigned char data_now=0x00;
-		pt=recv_buf;
-		for(cnt=0,index=0;cnt<recv_count-3-4;cnt+=2,index++)//转换为hex
-		{
-			memset(str_to_int_temp,0,9);
-			strncpy(str_to_int_temp,pt+cnt,2);
-			data_now=(unsigned char)str_to_hex(str_to_int_temp);
-			pt_data[index]=data_now;
-			//printf("rec_file_size_temp:%s 0x%02X\n",str_to_int_temp,pt_data[index]);
-		}
-		free(recv_buf);
-		ioctl(STDIN, TCSETAF, &sav);
-		fflush(STDIN);
-
-
-		//下面进入刷写模式
-		if(file_leixing_flag==1234)
-		{
-			printf("\nuser pro is Programing into Flash chip,file_len:%d\n",file_len);
-			user_data_write(received_file_data_buf,file_len);
-			printf("\nuser pro Programed Flash success.\n");
-		}
-		else if(file_leixing_flag==3512)
-		{
-			printf("\nPMON bin is Programing into Flash chip,file_len:%d\n",file_len);
-			pmon_data_write(received_file_data_buf,file_len);
-			printf("\nPMON bin Programed Flash success.\n");
-		}
-		free(received_file_data_buf);
-		received_file_data_buf=NULL;
+		fprintf(stderr, "%s: invalid file format\n",(load_nor_or_nand==USING_NOR)?"nor flash":nand_mtd_name);
+		return EXIT_FAILURE;
 	}
-	else
-		printf("CRC check faild,quit to program into chip\n");
-	return 1;
+	else if(load_nor_or_nand==USING_NAND&&!read_nand_fp)//已经读完了 可以关闭了
+	{
+		close(read_nand_fp);
+		read_nand_fp=0;
+	}
+	
+	printf ("user_load Entry address is %08x\n", ep);
+
+	if (md_cachestat())
+		flush_cache(DCACHE | ICACHE, NULL);
+	md_setpc(NULL, ep);
+	if (!(flags & SFLAG)) 
+	{
+		dl_setloadsyms();
+	}
+	return 0;
 }
+
 
 void auto_load_user_pro(void)
 {
-	char buf[LINESZ];
-	char *pa;
-	char *rd;
 	unsigned int dly;
 	unsigned int cnt;
 	struct termio sav;
-	int ret=1;
-	
+/*	
 	char * s=NULL;
 	s = getenv("user_pro");
 	if(s==NULL)
@@ -1041,7 +964,16 @@ void auto_load_user_pro(void)
 	}
 	printf("user_load sta:%s\n",s);
 	
-	if(strcmp(s,"yes")==0)
+	memset(nand_mtd_name,0,128);
+	if(strcmp(s,"/dev/mtd")>0)
+	{
+		strncpy(nand_mtd_name,s,strlen(s));
+		load_nor_or_nand=USING_NAND;
+	}
+	else if(strcmp(s,"nor_flash")==0)
+		load_nor_or_nand=USING_NOR;
+*/
+
 	{
 		char *d=NULL;
 		if(getenv("bootdelay"))
@@ -1073,7 +1005,7 @@ void auto_load_user_pro(void)
 		putchar('\n');
 		if(cnt==0)
 		{
-			printf("load user program int nor flash address:0x%x.\n",USER_DATA_POS);
+			//printf("load user program int nor flash address:0x%x.\n",USER_DATA_POS);
 			if(do_cmd("user_load")!=0)
 				return;
 			do_cmd("g");
@@ -1081,6 +1013,7 @@ void auto_load_user_pro(void)
 	}
 
 }
+
 
 
 //===================================crc16
@@ -1113,9 +1046,6 @@ unsigned char CRC_H[] = {
 0x00, 0xC1, 0x81, 0x40, 0x01, 0xC0, 0x80, 0x41, 0x01, 0xC0, 
 0x80, 0x41, 0x00, 0xC1, 0x81, 0x40 
 } ; 
-//=================================================================================================
-// CRC��λ�ֽ�ֵ��
-//----------------
 unsigned char CRC_L[] = { 
 0x00, 0xC0, 0xC1, 0x01, 0xC3, 0x03, 0x02, 0xC2, 0xC6, 0x06, 
 0x07, 0xC7, 0x05, 0xC5, 0xC4, 0x04, 0xCC, 0x0C, 0x0D, 0xCD, 
@@ -1146,13 +1076,6 @@ unsigned char CRC_L[] = {
 } ;
 
 
-/**************************************************************************************************
-    NAME : comp_crc16
-   INPUT : unsigned char *pack ���ݻ����׵�ַ, unsigned char num �����ֽ���
-  OUTPUT : unsigned int ����������λ��ǰ ��λ�ں�MODBUS �涨����
-FUNCTION : 
-	   CRC16 ���� MODBUSʹ�ù�ʽ��X16+X15+X2+1 ���˲�ͬ��CITT��ʽ
-**************************************************************************************************/
 unsigned int comp_crc16(unsigned char *pack, unsigned char num) 
 { 
 	unsigned char CRCcode_H = 0XFF;		// ��CRC�ֽڳ�ʼ��
@@ -1171,107 +1094,306 @@ unsigned int comp_crc16(unsigned char *pack, unsigned char num)
 	return (CRCcode_L << 8 | CRCcode_H);	// MODBUS �涨��λ��ǰ
 }
 
-
-char CRC16_checkPACK(unsigned char *rec_buff , int rec_num)//(512+2)*2
+//nand
+void write_into_nand_cmd(int ac, char *av[])
 {
-	if(rec_num==0||rec_num%2!=0)
-		return 0;
-	char ret=0;
-	int i=0,j=0;
-	unsigned char data_now=0;
-	unsigned char str_to_int_temp[9];
-	char *pt=rec_buff;
-	/*
-	printf("\n");
-	for(i=0;i<rec_num;i++)
-		printf("%c",rec_buff[i]);
-	printf("\n");
-	printf("rec_num:%d\n",rec_num);
-	*/
-	unsigned char * hex_change=(unsigned char*)malloc((rec_num-4)/2);
-	if(hex_change==NULL)
+	if(ac<4)
 	{
-		printf("Crc16 req mem faild\n");
-		return 0;
+		printf("useage: write_into_nand /dev/mtdx datas datas_len\n");
+		return;
 	}
-	memset(hex_change,0,(rec_num-4)/2);
-	
-	for(i=0,j=0;i<rec_num-4;i+=2,j++)
-	{
-		memset(str_to_int_temp,0,9);
-		strncpy(str_to_int_temp,pt+i,2);
-		data_now=(unsigned char)str_to_hex(str_to_int_temp);
-		hex_change[j]=data_now;
-	}
-	memset(str_to_int_temp,0,9);
-	strncpy(str_to_int_temp,pt+i,4);//剩余4个转为hex值
-	unsigned int rec_CRC=(unsigned int)str_to_hex(str_to_int_temp);//这个是发送过来的crc值
-	//printf("str_to_int_temp:%s rec_CRC:%08x now_CRC:%08x.\n",str_to_int_temp,rec_CRC,comp_crc16(hex_change,(rec_num-4)/2));
-	//for(i=0;i<rec_num;i++)
-	//	printf("%c",rec_buff[i]);
-	//printf("\n");
-	if(rec_CRC == comp_crc16(hex_change,(rec_num-4)/2))
-		ret=1;
-	else
-		ret=0;
-	
-	free(hex_change);
-	return ret;
-}
 
-char CRC16_check_all_data(unsigned char *data_buf , int data_buf_all_len,int data_buf_frame_len,unsigned char *crc_buf,int crc_len)//(512+2)*2
-{
-	char * p_data_buf=data_buf;
-	char * p_crc_buf=crc_buf;
-	int now_data_pos=0;
-	int now_crc_pos=0;
-	
-	//char crc_buf_temp[9];
-	//unsigned int rec_crc_data=0xffffffff;
-	//unsigned int now_crc_data=0xffffffff;
-	char ret=1;
+	char * data_buf;
+	unsigned int buf_len=atoi(av[3]);
+	char * mtd_name=av[1];
+	int bs=0x20000;
+	int seek=0;
+	int writed_len=0;
+	int wfp = open(mtd_name, O_RDWR|O_CREAT|O_TRUNC);
+	printf("_file[fp1].fs->devname  ret=%d\n",_file[wfp].fs->devname,strncmp(_file[wfp].fs->devname, "mtd", 3));
 
-	unsigned char *cpy_data_buf=(unsigned char*)malloc(data_buf_frame_len*2+10);
-	if(cpy_data_buf==NULL)
+	if (!strncmp(_file[wfp].fs->devname, "mtd", 3)) 
 	{
-		printf("CRC16_check_all_data req mem faild,quit\n");
-		return 0;
-	}
-	for(now_data_pos=0,now_crc_pos=0;now_data_pos<data_buf_all_len&&now_crc_pos<crc_len;now_data_pos+=data_buf_frame_len*2,now_crc_pos+=4)
-	{
-		memset(cpy_data_buf,0,data_buf_frame_len*2+10);
-		p_data_buf=data_buf+now_data_pos;
-		p_crc_buf=crc_buf+now_crc_pos;
-		if(data_buf_all_len-now_data_pos<data_buf_frame_len*2)//剩余的数据不够一帧了 结束了
+		mtdpriv *priv;
+		mtdfile *p;
+		priv = (mtdpriv *)_file[wfp].data;
+		p = priv->file;
+		if (p->mtd->type == MTD_NANDFLASH) 
 		{
-			strncpy(cpy_data_buf,p_data_buf,data_buf_all_len-now_data_pos);
+			bs = p->mtd->erasesize;
+			printf("bs=%d\n",bs);
 		}
-		else
-		{
-			strncpy(cpy_data_buf,p_data_buf,data_buf_frame_len*2);
-		}
-		strncat(cpy_data_buf,p_crc_buf,4);
-		ret=CRC16_checkPACK(cpy_data_buf,strlen(cpy_data_buf));
-		if(ret==0)
-			break;
-		/*memset(crc_buf_temp,0,9);
-		p_data_buf=data_buf+now_data_pos;
-		p_crc_buf=crc_buf+now_crc_pos;
-		strncpy(crc_buf_temp,p_crc_buf,4);
-		rec_crc_data=str_to_hex(crc_buf_temp);
-
+	}
+	if (!wfp) 
+	{
+		printf("open file error!\n");
+		return ;
+	}
+	
+	lseek(wfp, seek*bs, SEEK_SET);
+	writed_len=write(wfp, av[2], buf_len);
+	printf("writed_len:%d\n",writed_len);
 		
-		now_crc_data=comp_crc16(p_data_buf,data_buf_frame_len);
-		printf("rec_crc_data:0x%08x now_crc_data:0x%08x\n",rec_crc_data,now_crc_data);
-		if(rec_crc_data!=now_crc_data)
-			ret=0;
-		*/
+	close(wfp);
+}
+
+void read_from_nand_cmd(int ac, char *av[])
+{
+	if(ac<4)
+	{
+		printf("useage: read_from_nand /dev/mtdx offset datas_len\n");
+		return;
 	}
-	return ret;
+	int read_len=atoi(av[3]);
+	char * read_buf=(char*)malloc(read_len+10);
+	if(!read_buf)
+	{
+		printf("req read_buf faild\n");
+		return;
+	}
+
+	char * pt=av[2]+2;
+	char ret=panduan_hex(pt);
+	if(ret==0)
+	{
+		printf("arg 2 not a hex addr.for example:0x12345678\n");
+		return 0;
+	}
+	int seek=str_to_hex(pt);
+	
+	int bs=0x20000;
+	int rfp = open(av[1], O_RDONLY);
+	if (!rfp) 
+	{
+		printf("open file:%s error!\n",av[1]);
+		free(read_buf);
+		return ;
+	}
+	lseek(rfp, seek, SEEK_SET);//*bs
+	int readed_len=read(rfp,read_buf,read_len);
+	show_hex(read_buf,readed_len);
+	close(rfp);
+}
+
+int read_from_nand_data(int addr,char*buf,int buf_len)
+{
+	if(!read_nand_fp)
+		return 0;
+	lseek(read_nand_fp, addr, SEEK_SET);
+	return read(read_nand_fp,buf,buf_len);
+}
+
+int write_into_nand_data(char * buf,int buf_len,unsigned int addr)
+{
+	int wfp = open(nand_mtd_name, O_RDWR|O_CREAT|O_TRUNC);
+	if (!wfp) 
+	{
+		printf("open file:%s error!\n",nand_mtd_name);
+		return ;
+	}
+	lseek(wfp, addr, SEEK_SET);
+	int writed_len=write(wfp, buf, buf_len);
+	printf("write_into_nand_data writed_len:%d\n",writed_len);
+	close(wfp);
 }
 
 
+#include <sys/sys/termios.h>
+int recv_hex_data(int ac, char *av[])
+{
+	unsigned int cnt;
+	unsigned char *recv_buf=NULL;//存储文件数据
+	int recv_count=0;
+	char return_flag=0;
+	
+	unsigned char *pt=NULL,*pt_data=NULL;
+	char str_to_int_temp[9];
+	
+	char start_rec_flag=1;
+	char start_rec_counter=0;
+	char rec_file_size_temp[64];
+	int file_len=0;
+	int frame_len=0;
+	int frame_one_time_counter=0;
+	int file_leixing_flag=0;
 
+	char stdin_read_temp[4096];
+	int stdin_read_temp_len=0;
+	
+	struct termio t_sav_arg,t_now_arg;
+	
+	init_nand_or_nor_env();//初始化环境
+	memset(rec_file_size_temp,0,64);
+	
+	ioctl(STDIN, TCGETA, &t_sav_arg);
+	memcpy(&t_now_arg,&t_sav_arg,sizeof(struct termio));
+	t_now_arg.c_oflag =0;
+	t_now_arg.c_lflag =0;
+	t_now_arg.c_iflag =0;
+	t_now_arg.c_cflag =0;
+	ioctl(STDIN, TCSETAF, &t_now_arg);
+	ioctl(STDIN, TCSETAF, &t_now_arg);
+	ioctl(STDIN, TCSETAF, &t_now_arg);
+	ioctl(STDIN, FIONREAD, &cnt);
+	while(cnt)//清空缓存先
+	{
+		getchar();
+		ioctl(STDIN, FIONREAD, &cnt);
+	}
+	while(1)
+	{
+		ioctl (STDIN, FIONREAD, &cnt);
+		if(start_rec_flag&&cnt>0&&start_rec_counter<24)//先接收文件发送的相关信息
+		{
+			for(;cnt!=0&&start_rec_counter<24;start_rec_counter++,cnt--)
+				rec_file_size_temp[start_rec_counter]=(char)getchar();
+
+			if(start_rec_counter==24)
+			{
+				pt=rec_file_size_temp;
+				memset(str_to_int_temp,0,9);
+				strncpy(str_to_int_temp,pt,8);
+				file_len=str_to_hex(str_to_int_temp);
+				
+				memset(str_to_int_temp,0,9);
+				strncpy(str_to_int_temp,pt+8,8);
+				frame_len=str_to_hex(str_to_int_temp);
+
+				memset(str_to_int_temp,0,9);
+				strncpy(str_to_int_temp,pt+16,8);
+				file_leixing_flag=str_to_hex(str_to_int_temp);
+
+				if(file_leixing_flag!=3512&&file_leixing_flag!=1234)
+				{
+					ioctl(STDIN, TCSETAF, &t_sav_arg);
+					printf("recv file head info check faild:%d.\n",file_leixing_flag);
+					return 0;
+				}
+				
+				//printf("file_len:%d frame_len:%d pass:%d\n",file_len,frame_len,file_leixing_flag);
+				recv_buf=(unsigned char *)malloc((file_len+14)*sizeof(unsigned char));
+				if(recv_buf==NULL)
+				{
+					ioctl(STDIN, TCSETAF, &t_sav_arg);
+					printf("req recv_file mem faild.quit recv file.\n");
+					return 0;
+				}
+				memset(recv_buf,0,file_len+14);
+				
+				start_rec_flag=0;
+				SEND_NEXT_FILE_DATA;
+			}
+
+		}
+		
+		if(!start_rec_flag&&cnt>0)//继续接收剩下的文件数据
+		{
+			memset(stdin_read_temp,0,4096);
+			stdin_read_temp_len=read(STDIN,stdin_read_temp,cnt);
+			int xxi=0;
+			for(xxi=0;xxi<stdin_read_temp_len;xxi++,frame_one_time_counter++,recv_count++)
+			{
+				recv_buf[recv_count]=stdin_read_temp[xxi];
+				if(recv_buf[recv_count]=='@'&&recv_count>3&&recv_buf[recv_count-3]=='e'&& recv_buf[recv_count-2]=='n'&& recv_buf[recv_count-1]=='d')
+				{
+					return_flag=1;
+					break;
+				}
+			}
+			if(return_flag==0&&frame_one_time_counter>=frame_len+2)//接受完一段文件数据 数据串中最后2字节是crc16校验数据
+			{
+				char*ptt=recv_buf;
+				ptt=ptt+recv_count-2;//定位到crc位置
+
+				unsigned short crc_rec=0xffff;
+				memcpy((char*)&crc_rec,ptt,2);//将crc数据复制进crc_rec;
+
+				if(crc_rec!=comp_crc16(ptt-frame_len,frame_len))//校验失败
+				{
+					ioctl(STDIN, TCSETAF, &t_sav_arg);
+					free(recv_buf);
+					printf("CRC verification faild crc_rec:0x%08x,0x%08x\n.",crc_rec,comp_crc16(ptt-frame_len,frame_len));
+					return 0;
+				}
+				else//下一帧数据
+				{
+					recv_count=recv_count-2;//去掉结尾的2个字节的校验数据
+					frame_one_time_counter=0;
+					SEND_NEXT_FILE_DATA;
+				}
+			}
+		}
+		
+		if(return_flag)//文件发送结束
+		{
+			recv_count=recv_count-2-3;//去掉结尾的2个校验数据和end数据 recv_count最后一次没有+1
+			unsigned int last_frame_len=file_len%frame_len;//最后一帧数据的长度
+			if(!last_frame_len)//不是正好为空的
+			{
+				unsigned short crc_rec=0xffff;
+				memcpy((char*)&crc_rec,recv_buf+recv_count,2);//将crc数据复制进crc_buf;
+				
+				if(crc_rec!=comp_crc16(recv_buf+recv_count-last_frame_len,last_frame_len))
+				{
+					ioctl(STDIN, TCSETAF, &t_sav_arg);
+					free(recv_buf);
+					printf("Last frame CRC verification faild crc_rec:0x%08x,0x%08x\n.",crc_rec,comp_crc16(recv_buf+recv_count-last_frame_len,last_frame_len));
+					return 0;
+				}
+			}
+			break;
+		}
+	}
+
+	ioctl(STDIN, TCSETAF, &t_sav_arg);//还原term默认状态
+	//show_hex(recv_buf,recv_count);
+	printf("\nreceived all file data.\n");
+
+	//下面进入刷写模式
+	if(file_leixing_flag==1234)
+	{
+		printf("\nuser pro is Programing into Flash chip,file_len:%d\n",file_len);
+		if(load_nor_or_nand==USING_NOR)
+			user_data_write(recv_buf,file_len);
+		else if(load_nor_or_nand==USING_NAND)
+		{
+			write_into_nand_data(recv_buf,file_len,0);
+			//检查文件写入是否没有问题
+			/*
+			char * test_read=(char*)malloc(file_len);
+			memset(test_read,0,file_len);
+			int rfp = open(nand_mtd_name, O_RDONLY);
+			if (!rfp) 
+			{
+				printf("open file:%s error!\n",av[1]);
+				return ;
+			}
+			lseek(rfp, 0, SEEK_SET);//*bs
+			int readed_len=read(rfp,test_read,file_len);
+			close(rfp);
+			
+			int ixxx=0;
+			printf("jinru ceshi yanzheng\n");
+			for(ixxx=0;ixxx<file_len;ixxx++)
+			{
+				if(test_read[ixxx]!=recv_buf[ixxx])
+					printf("error %d:%02x %02x;\n",ixxx,(unsigned char)test_read[ixxx],(unsigned char)recv_buf[ixxx]);
+			}
+			free(test_read);
+			*/
+		}
+		printf("\nuser pro Programed Flash success.\n");
+	}
+	else if(file_leixing_flag==3512)
+	{
+		printf("\nPMON bin is Programing into Flash chip,file_len:%d\n",file_len);
+		pmon_data_write(recv_buf,file_len);
+		printf("\nPMON bin Programed Flash success.\n");
+	}
+	
+	free(recv_buf);
+	return 1;
+}
 
 
 
