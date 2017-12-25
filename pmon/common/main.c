@@ -282,7 +282,7 @@ int main(void)
 	char *s;
 
 	s=getenv("user_pro");//查找裸机程序运行变量 
-	if(s==NULL||strcmp(s,"yes")!=0)//环境变量没有设置或者不等yes
+	if(s==NULL||find_desc_from_src(0,s,strlen(s),"/dev/mtd",8)==-1&&strcmp(s,"nor_flash")!=0)
 	{
 		s = getenv("al");//执行默认设置
 		if(s) autoload(s);
